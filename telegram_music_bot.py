@@ -7,26 +7,23 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant
 
-# FINAL, HIGHLY SPECIFIC IMPORTS to resolve ModuleNotFoundError
-from pytgcalls import PyTgCalls, idle
-from pytgcalls.types.input_parameters import AudioPiped 
-from pytgcalls.types.input_parameters.quality import AudioQuality
-from pytgcalls.types.stream import GroupCall 
+# --- NEW STABLE VOICE CALL IMPORTS ---
+# This library is a more stable wrapper for streaming audio via Pyrogram.
+from pyrogram_voice_chat import GroupCallFactory, Stream
+from pyrogram_voice_chat.stream import AudioQuality
 
-# Import the automated Lavalink server manager
-from lavalink_setup import LavalinkManager
-
-# Import the Python client for Lavalink
-import lavalink
+# --- NEW MUSIC SOURCING LIBRARY ---
+import yt_dlp
+import json
 
 # -------------------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------------------
 # Load config from environment variables
-API_ID = os.environ.get("37862320")
-API_HASH = os.environ.get("cdb4a59a76fae6bd8fa42e77455f8697")
-BOT_TOKEN = os.environ.get("8341511264:AAFjNIOYE5NbABPloFbz-r989l2ySRUs988")
-SESSION_STRING = os.environ.get("BQJBu7AAhhG6MmNUFoqJukQOFZDPl5I4QrcapymDjzK5XNYTqaofTEqI5v12xgg0_xkARp-oRG0bXkUhmRB5ziTmjbDSh4I0ty2tGheoT6-mEzOYIsUKMXRuNfAb-Li9eAvlokTfxwCVa9HTBnOD3cPe_plNAUpRuyk5FtUmdeV5Wu_lWcE5cRECGnW0SHO24GiyHoK8jK6BAVL25rVnwLqktC1O2IZn3cam0hCs2ZqSF_B_4Z-8cuREGMaO8IrRnhOl3adW5sUzlOz14FmrHlGeyAL_s8Cb0tgFbST6EAFW25MWVv_0FG_cKbAxWCoR7u9uG4AhX6NrG3g3Z3ZB53N06rEL8AAAAAHQ8OAyAA") # Userbot session string
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SESSION_STRING = os.environ.get("SESSION_STRING") # Userbot session string
 
 # Check if all configs are set
 if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
@@ -40,224 +37,202 @@ except ValueError:
     print("Error: API_ID must be an integer.")
     sys.exit(1)
 
-LAVALINK_HOST = "127.0.0.1"
-LAVALINK_PORT = 2333
-LAVALINK_PASS = "youshallnotpass"
-
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------------------
-# Bot & Client Initialization
-# -------------------------------------------------------------------------------
+# Global instances (simplified)
+bot = None
+user_app = None
+group_call_factory = None
+# Dictionary to store the GroupCall instance for each chat
+group_calls: Dict[int, 'GroupCall'] = {}
 
-# Pyrogram Bot Client (Handles commands)
-bot = Client(
-    "MusicBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-)
-
-# Pyrogram User Client (Handles audio streaming via PyTgCalls)
-# We use the Session String for this.
-user_app = Client(
-    "MusicUser",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-)
-
-# PyTgCalls Client (The bridge)
-pytgcalls = PyTgCalls(user_app)
-
-# Lavalink Client (Handles searching and track loading)
-lavalink_client = None
-
-# In-memory queue
-# { chat_id: [track, track, ...] }
-queue: Dict[int, List[lavalink.Track]] = {}
-current_track: Dict[int, lavalink.Track] = {}
+# In-memory queue storage
+# The 'Track' object is now a simple dict containing URL and title
+# { chat_id: [track_dict, track_dict, ...] }
+queue: Dict[int, List[Dict]] = {}
 
 # -------------------------------------------------------------------------------
-# Lavalink Event Handlers
+# Helper Functions
 # -------------------------------------------------------------------------------
 
-# This event is triggered when a track starts playing
-@pytgcalls.on_stream_start()
-async def on_stream_start(client: GroupCall, track):
-    # track.chat is available in newer pytgcalls versions
-    chat_id = track.chat.id
-    if chat_id in current_track:
-        song = current_track[chat_id]
-        await bot.send_message(
-            chat_id,
-            f"▶️ **Now Playing:**\n\n[{song.title}]({song.uri})\nby {song.author}"
-        )
+def extract_audio_info(query: str) -> Dict | None:
+    """Uses yt-dlp to extract the best streaming URL and metadata."""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'default_search': 'ytsearch',
+        'extract_flat': 'in_playlist',
+        'force_ipv4': True,
+        'cachedir': False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if 'entries' in info:
+                # Get the first result from a search
+                info = info['entries'][0]
+            
+            # Find the best quality stream URL
+            audio_url = info.get('url') # yt-dlp finds the direct stream URL
+            
+            if not audio_url:
+                # Fallback to finding a suitable stream format
+                for fmt in info.get('formats', []):
+                    if fmt.get('acodec') != 'none' and fmt.get('ext') in ['m4a', 'mp3', 'webm', 'ogg']:
+                        audio_url = fmt.get('url')
+                        break
+            
+            if not audio_url:
+                 # If we still don't have a URL, it's a failure
+                 return None
 
-# This event is crucial. It's triggered when a track finishes.
-@pytgcalls.on_stream_end()
-async def on_stream_end(client: GroupCall, track):
-    chat_id = track.chat.id
-    current_track.pop(chat_id, None)
-    
+            return {
+                "title": info.get('title', 'Unknown Title'),
+                "url": audio_url,
+                "duration": info.get('duration'),
+                "webpage_url": info.get('webpage_url')
+            }
+
+    except Exception as e:
+        logger.error(f"yt-dlp extraction failed: {e}")
+        return None
+
+async def play_next_in_queue(chat_id: int):
+    """Handles playing the next song or leaving the call if the queue is empty."""
     if chat_id in queue and queue[chat_id]:
-        # Get next song from queue
         next_song = queue[chat_id].pop(0)
-        current_track[chat_id] = next_song
         
-        # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
-        stream_url = next_song.stream_url
+        # Stream needs to be re-created for the new track
+        new_stream = Stream(
+            next_song['url'],
+            quality=AudioQuality.HIGH,
+            title=next_song['title']
+        )
         
-        # Play the next song using AudioPiped stream with High quality
         try:
-            await pytgcalls.change_stream(
+            # Change stream using the new library's method
+            await group_calls[chat_id].change_stream(new_stream)
+            await bot.send_message(
                 chat_id,
-                AudioPiped(
-                    stream_url,
-                    quality=AudioQuality.HIGH
-                )
+                f"▶️ **Now Playing:**\n\n[{next_song['title']}]({next_song['webpage_url']})"
             )
         except Exception as e:
             logger.error(f"Error playing next song in {chat_id}: {e}")
             await bot.send_message(chat_id, f"Error playing next song: {e}")
+            # If playback fails, try the next song recursively
+            await play_next_in_queue(chat_id) 
+
     else:
         # Queue is empty, leave the call
-        try:
-            await pytgcalls.leave_group_call(chat_id)
-            await bot.send_message(chat_id, "⏹ Queue finished, leaving voice chat.")
-        except Exception as e:
-            logger.error(f"Error leaving group call in {chat_id}: {e}")
+        if chat_id in group_calls:
+            try:
+                await group_calls[chat_id].stop()
+                group_calls.pop(chat_id)
+                await bot.send_message(chat_id, "⏹ Queue finished, leaving voice chat.")
+            except Exception as e:
+                logger.error(f"Error leaving group call in {chat_id}: {e}")
 
 # -------------------------------------------------------------------------------
 # Bot Command Handlers
 # -------------------------------------------------------------------------------
 
-@bot.on_message(filters.command("start") & filters.private)
-async def start_command(_, message: Message):
-    await message.reply(
-        "Hi! I'm a Lavalink music bot.\n"
-        "Add me to a group chat and I'll play music.\n\n"
-        "**Commands:**\n"
-        " - /play [query] - Play a song or add to queue\n"
-        " - /stop - Stop playback and leave\n"
-        " - /skip - Skip to the next song\n"
-        " - /queue - Show the current queue"
-    )
-
 @bot.on_message(filters.command("play") & filters.group)
 async def play_command(_, message: Message):
     chat_id = message.chat.id
-    user_id = message.from_user.id
     query = " ".join(message.command[1:])
 
     if not query:
         return await message.reply("Please provide a song name or YouTube URL.")
         
-    # Search for the track on Lavalink
-    try:
-        # We need the full stream URL from the Lavalink track
-        results = await lavalink_client.get_tracks(f"ytsearch:{query}")
-    except Exception as e:
-        logger.error(f"Lavalink search error: {e}")
-        return await message.reply(f"Error searching for track: {e}")
+    m = await message.reply("🔎 Searching and processing audio stream...")
+    
+    # 1. Search and extract track info
+    track = await asyncio.get_event_loop().run_in_executor(
+        None, # Use default thread pool for blocking I/O (yt-dlp)
+        extract_audio_info,
+        query
+    )
 
-    if not results or not results.tracks:
-        return await message.reply("No tracks found.")
+    if not track:
+        await m.edit("❌ Error: Could not find or process the audio stream.")
+        return
 
-    # Get the first track from the search
-    track = results.tracks[0]
-    track.requester = user_id # Store who requested the song
-
-    # Check if currently playing
-    is_playing = chat_id in current_track
+    # 2. Check if currently playing
+    is_playing = chat_id in group_calls and group_calls[chat_id].is_connected
 
     if is_playing:
         # Add to queue
         if chat_id not in queue:
             queue[chat_id] = []
         queue[chat_id].append(track)
-        await message.reply(f"✅ **Added to queue:**\n[{track.title}]({track.uri})")
+        await m.edit(f"✅ **Added to queue:**\n[{track['title']}]({track['webpage_url']})")
     else:
         # Play immediately
-        current_track[chat_id] = track
         
-        # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
-        stream_url = track.stream_url
+        # 3. Create a Stream object from the extracted URL
+        audio_stream = Stream(
+            track['url'],
+            quality=AudioQuality.HIGH,
+            title=track['title'],
+            # Set the callback for when the stream ends (Crucial!)
+            on_finished=lambda: asyncio.create_task(play_next_in_queue(chat_id))
+        )
 
         try:
-            # Join the voice chat using AudioPiped stream
-            await pytgcalls.join_group_call(
-                chat_id,
-                AudioPiped(
-                    stream_url,
-                    quality=AudioQuality.HIGH
-                ),
-                stream_type=GroupCall.STREAM_TYPE_MUSIC,
-            )
-            # The 'on_stream_start' event will handle the "Now Playing" message
+            # 4. Join the voice chat
+            group_call = group_call_factory.get_group_call()
+            await group_call.start(chat_id)
+            await group_call.join_group_call(audio_stream)
+            
+            group_calls[chat_id] = group_call
+            
+            await m.edit(f"▶️ **Now Playing:**\n\n[{track['title']}]({track['webpage_url']})")
+
         except UserAlreadyParticipant:
-            # Already in the call, just change the stream
-            await pytgcalls.change_stream(
-                chat_id,
-                AudioPiped(
-                    stream_url,
-                    quality=AudioQuality.HIGH
-                )
-            )
+            # Already in the call, just change the stream (this is highly unlikely with this library's flow)
+            await group_calls[chat_id].change_stream(audio_stream)
+            await m.edit(f"▶️ **Now Playing:**\n\n[{track['title']}]({track['webpage_url']})")
+
         except UserNotParticipant:
-            await message.reply("I can't join. Please check my userbot's permissions.")
+            await m.edit("❌ I can't join. Please check my userbot's permissions.")
         except Exception as e:
             logger.error(f"Error joining call in {chat_id}: {e}")
-            await message.reply(f"Error: {e}")
-            current_track.pop(chat_id, None)
+            await m.edit(f"❌ Error: {e}")
+            if chat_id in group_calls:
+                await group_calls[chat_id].stop()
+                group_calls.pop(chat_id)
 
 @bot.on_message(filters.command("skip") & filters.group)
 async def skip_command(_, message: Message):
     chat_id = message.chat.id
 
-    if chat_id not in current_track:
+    if chat_id not in group_calls or not group_calls[chat_id].is_connected:
         return await message.reply("Not playing anything.")
-
-    if not queue.get(chat_id):
-        await message.reply("Queue is empty, stopping playback.")
-        await pytgcalls.leave_group_call(chat_id)
-        current_track.pop(chat_id, None)
-        return
-
-    # Get next song
-    next_song = queue[chat_id].pop(0)
-    current_track[chat_id] = next_song
+        
+    await message.reply("⏭ **Skipping track...**")
     
-    # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
-    stream_url = next_song.stream_url
-
+    # Trigger the next song immediately by stopping the current stream
+    # The 'on_finished' callback in the stream handles playing the next song.
     try:
-        await pytgcalls.change_stream(
-            chat_id,
-            AudioPiped(
-                stream_url,
-                quality=AudioQuality.HIGH
-            )
-        )
-        await message.reply("⏭ **Skipped!**")
-        # 'on_stream_start' will announce the new song
+        await group_calls[chat_id].stop_stream()
     except Exception as e:
-        logger.error(f"Error skipping in {chat_id}: {e}")
-        await message.reply(f"Error skipping: {e}")
+        logger.error(f"Error during skip: {e}")
+        await play_next_in_queue(chat_id)
 
 
 @bot.on_message(filters.command("stop") & filters.group)
 async def stop_command(_, message: Message):
     chat_id = message.chat.id
     
-    if chat_id not in current_track:
+    if chat_id not in group_calls or not group_calls[chat_id].is_connected:
         return await message.reply("Not playing anything.")
         
     try:
-        await pytgcalls.leave_group_call(chat_id)
-        current_track.pop(chat_id, None)
+        await group_calls[chat_id].stop()
+        group_calls.pop(chat_id)
         queue.pop(chat_id, None)
         await message.reply("⏹ **Stopped playback** and left voice chat.")
     except Exception as e:
@@ -268,20 +243,25 @@ async def stop_command(_, message: Message):
 async def queue_command(_, message: Message):
     chat_id = message.chat.id
     
-    if chat_id not in current_track:
+    if chat_id not in group_calls or not group_calls[chat_id].is_connected:
         return await message.reply("Not playing anything.")
 
     msg = "**Current Queue:**\n\n"
     
-    # Show current track
-    song = current_track[chat_id]
-    msg += f"**Now Playing:**\n[{song.title}]({song.uri})\n\n"
-
+    # Since the current song title is attached to the stream object
+    try:
+        current_title = group_calls[chat_id].active_stream.title
+        current_url = group_calls[chat_id].active_stream.url
+        msg += f"**Now Playing:**\n[{current_title}](https://www.youtube.com/watch?v={current_url.split('/')[4].split('?')[0]})\n\n" # Crude way to get YouTube link
+    except:
+        msg += "**Now Playing:** *Error retrieving current track info.*\n\n"
+        
     # Show upcoming tracks
     if queue.get(chat_id):
         msg += "**Up Next:**\n"
         for i, track in enumerate(queue[chat_id][:10], start=1):
-            msg += f"`{i}.` [{track.title}]({track.uri})\n"
+            # Using the stored webpage_url as the link
+            msg += f"`{i}.` [{track['title']}]({track['webpage_url']})\n"
         
         if len(queue[chat_id]) > 10:
             msg += f"\n...and {len(queue[chat_id]) - 10} more."
@@ -296,37 +276,21 @@ async def queue_command(_, message: Message):
 # -------------------------------------------------------------------------------
 
 async def main():
-    global lavalink_client
+    global bot, user_app, group_call_factory
     
-    lavalink_manager = None
     try:
-        # 1. Start the automated Lavalink server
-        lavalink_manager = LavalinkManager()
-        await lavalink_manager.start()
-        
-        # 2. Start the Pyrogram clients (Bot + User)
+        # 1. Start the Pyrogram clients (Bot + User)
         logger.info("Starting Pyrogram clients...")
+        bot = Client("MusicBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+        user_app = Client("MusicUser", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+        
         await bot.start()
         await user_app.start()
-        
-        # 3. Start PyTgCalls
-        logger.info("Starting PyTgCalls...")
-        await pytgcalls.start()
 
-        # 4. Get the userbot's ID (needed for Lavalink client)
-        userbot_me = await user_app.get_me()
+        # 2. Initialize the Group Call Factory
+        group_call_factory = GroupCallFactory(user_app, 'telegram_music_bot.session')
         
-        # 5. Initialize and connect the Lavalink client
-        logger.info("Initializing Lavalink client...")
-        lavalink_client = lavalink.Client(user_id=userbot_me.id)
-        lavalink_client.add_node(
-            host=LAVALINK_HOST,
-            port=LAVALINK_PORT,
-            password=LAVALINK_PASS,
-            region="us-central" # Region is arbitrary
-        )
-        
-        logger.info("Bot is fully operational!")
+        logger.info("Bot is fully operational with stable streaming!")
         await idle()
         
     except KeyboardInterrupt:
@@ -334,14 +298,16 @@ async def main():
     except Exception as e:
         logger.error(f"Unhandled exception: {e}", exc_info=True)
     finally:
-        # 6. Stop everything gracefully
+        # 3. Stop everything gracefully
         logger.info("Stopping clients...")
-        if bot.is_connected:
+        if bot and bot.is_connected:
             await bot.stop()
-        if user_app.is_connected:
+        if user_app and user_app.is_connected:
             await user_app.stop()
-        if lavalink_manager:
-            lavalink_manager.stop()
+        # Clean up any active calls
+        for call in group_calls.values():
+            if call.is_connected:
+                await call.stop()
         logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
