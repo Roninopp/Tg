@@ -7,11 +7,11 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant
 
-# Use the top-level import for maximum compatibility across different py-tgcalls versions.
+# Simplified and stable imports for pytgcalls
 from pytgcalls import PyTgCalls, idle
-# CORRECTED IMPORTS for current stable py-tgcalls (reverting to the fix from two steps ago)
-from pytgcalls.types.input_stream import AudioLavalink, AudioPiped 
+from pytgcalls.types.input_stream import AudioPiped # Using AudioPiped for maximum compatibility
 from pytgcalls.types.stream import GroupCall 
+from pytgcalls.types.input_stream.quality import HighQualityAudio # Needed for AudioPiped
 
 # Import the automated Lavalink server manager
 from lavalink_setup import LavalinkManager
@@ -23,10 +23,10 @@ import lavalink
 # Configuration
 # -------------------------------------------------------------------------------
 # Load config from environment variables
-API_ID = os.environ.get("37862320")
-API_HASH = os.environ.get("cdb4a59a76fae6bd8fa42e77455f8697")
-BOT_TOKEN = os.environ.get("8341511264:AAFjNIOYE5NbABPloFbz-r989l2ySRUs988")
-SESSION_STRING = os.environ.get("BQJBu7AAhhG6MmNUFoqJukQOFZDPl5I4QrcapymDjzK5XNYTqaofTEqI5v12xgg0_xkARp-oRG0bXkUhmRB5ziTmjbDSh4I0ty2tGheoT6-mEzOYIsUKMXRuNfAb-Li9eAvlokTfxwCVa9HTBnOD3cPe_plNAUpRuyk5FtUmdeV5Wu_lWcE5cRECGnW0SHO24GiyHoK8jK6BAVL25rVnwLqktC1O2IZn3cam0hCs2ZqSF_B_4Z-8cuREGMaO8IrRnhOl3adW5sUzlOz14FmrHlGeyAL_s8Cb0tgFbST6EAFW25MWVv_0FG_cKbAxWCoR7u9uG4AhX6NrG3g3Z3ZB53N06rEL8AAAAAHQ8OAyAA") # Userbot session string
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SESSION_STRING = os.environ.get("SESSION_STRING") # Userbot session string
 
 # Check if all configs are set
 if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
@@ -87,6 +87,7 @@ current_track: Dict[int, lavalink.Track] = {}
 # This event is triggered when a track starts playing
 @pytgcalls.on_stream_start()
 async def on_stream_start(client: GroupCall, track):
+    # track.chat is available in newer pytgcalls versions
     chat_id = track.chat.id
     if chat_id in current_track:
         song = current_track[chat_id]
@@ -106,13 +107,16 @@ async def on_stream_end(client: GroupCall, track):
         next_song = queue[chat_id].pop(0)
         current_track[chat_id] = next_song
         
-        # Play the next song
+        # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
+        stream_url = next_song.stream_url
+        
+        # Play the next song using AudioPiped stream
         try:
             await pytgcalls.change_stream(
                 chat_id,
-                AudioLavalink(
-                    next_song.track,
-                    user_id=next_song.requester
+                AudioPiped(
+                    stream_url,
+                    quality=HighQualityAudio
                 )
             )
         except Exception as e:
@@ -153,6 +157,7 @@ async def play_command(_, message: Message):
         
     # Search for the track on Lavalink
     try:
+        # We need the full stream URL from the Lavalink track
         results = await lavalink_client.get_tracks(f"ytsearch:{query}")
     except Exception as e:
         logger.error(f"Lavalink search error: {e}")
@@ -177,13 +182,17 @@ async def play_command(_, message: Message):
     else:
         # Play immediately
         current_track[chat_id] = track
+        
+        # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
+        stream_url = track.stream_url
+
         try:
-            # Join the voice chat
+            # Join the voice chat using AudioPiped stream
             await pytgcalls.join_group_call(
                 chat_id,
-                AudioLavalink(
-                    track.track,
-                    user_id=user_id
+                AudioPiped(
+                    stream_url,
+                    quality=HighQualityAudio
                 ),
                 stream_type=GroupCall.STREAM_TYPE_MUSIC,
             )
@@ -192,9 +201,9 @@ async def play_command(_, message: Message):
             # Already in the call, just change the stream
             await pytgcalls.change_stream(
                 chat_id,
-                AudioLavalink(
-                    track.track,
-                    user_id=user_id
+                AudioPiped(
+                    stream_url,
+                    quality=HighQualityAudio
                 )
             )
         except UserNotParticipant:
@@ -221,12 +230,15 @@ async def skip_command(_, message: Message):
     next_song = queue[chat_id].pop(0)
     current_track[chat_id] = next_song
     
+    # NOTE: Lavalink track objects have a 'stream_url' attribute for raw audio.
+    stream_url = next_song.stream_url
+
     try:
         await pytgcalls.change_stream(
             chat_id,
-            AudioLavalink(
-                next_song.track,
-                user_id=next_song.requester
+            AudioPiped(
+                stream_url,
+                quality=HighQualityAudio
             )
         )
         await message.reply("⏭ **Skipped!**")
