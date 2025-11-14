@@ -7,12 +7,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant
 
-# This is the bridge library you need.
+# Use the top-level import for maximum compatibility across different py-tgcalls versions.
 from pytgcalls import PyTgCalls, idle
-# CORRECTED IMPORTS: 'AudioLavalink' and 'AudioPiped' moved to input_stream, 
-# 'GroupCall' moved to stream in newer pytgcalls versions.
-from pytgcalls.types.input_stream import AudioLavalink, AudioPiped 
-from pytgcalls.types.stream import GroupCall 
+from pytgcalls.types import AudioLavalink, AudioPiped # Reverting to the old structure
+from pytgcalls.types.stream import GroupCall # This one is typically stable
 
 # Import the automated Lavalink server manager
 from lavalink_setup import LavalinkManager
@@ -24,10 +22,10 @@ import lavalink
 # Configuration
 # -------------------------------------------------------------------------------
 # Load config from environment variables
-API_ID = os.environ.get("37862320")
-API_HASH = os.environ.get("cdb4a59a76fae6bd8fa42e77455f8697")
-BOT_TOKEN = os.environ.get("8341511264:AAFjNIOYE5NbABPloFbz-r989l2ySRUs988")
-SESSION_STRING = os.environ.get("BQJBu7AAhhG6MmNUFoqJukQOFZDPl5I4QrcapymDjzK5XNYTqaofTEqI5v12xgg0_xkARp-oRG0bXkUhmRB5ziTmjbDSh4I0ty2tGheoT6-mEzOYIsUKMXRuNfAb-Li9eAvlokTfxwCVa9HTBnOD3cPe_plNAUpRuyk5FtUmdeV5Wu_lWcE5cRECGnW0SHO24GiyHoK8jK6BAVL25rVnwLqktC1O2IZn3cam0hCs2ZqSF_B_4Z-8cuREGMaO8IrRnhOl3adW5sUzlOz14FmrHlGeyAL_s8Cb0tgFbST6EAFW25MWVv_0FG_cKbAxWCoR7u9uG4AhX6NrG3g3Z3ZB53N06rEL8AAAAAHQ8OAyAA") # Userbot session string
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SESSION_STRING = os.environ.get("SESSION_STRING") # Userbot session string
 
 # Check if all configs are set
 if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
@@ -88,7 +86,7 @@ current_track: Dict[int, lavalink.Track] = {}
 # This event is triggered when a track starts playing
 @pytgcalls.on_stream_start()
 async def on_stream_start(client: GroupCall, track):
-    chat_id = track.chat_id
+    chat_id = track.chat.id
     if chat_id in current_track:
         song = current_track[chat_id]
         await bot.send_message(
@@ -99,7 +97,7 @@ async def on_stream_start(client: GroupCall, track):
 # This event is crucial. It's triggered when a track finishes.
 @pytgcalls.on_stream_end()
 async def on_stream_end(client: GroupCall, track):
-    chat_id = track.chat_id
+    chat_id = track.chat.id
     current_track.pop(chat_id, None)
     
     if chat_id in queue and queue[chat_id]:
