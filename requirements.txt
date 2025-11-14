@@ -1,1 +1,24 @@
+# Core Telegram Bot Framework
+pyrogram==2.0.106
+tgcrypto==1.2.5
 
+# YouTube Downloader
+yt-dlp==2023.12.30
+
+# Async HTTP & File Operations
+aiohttp==3.9.1
+aiofiles==23.2.1
+
+# Media Processing
+ffmpeg-python==0.2.0
+
+# Additional Dependencies
+requests==2.31.0
+python-dotenv==1.0.0
+
+# Audio Processing (Optional but recommended)
+pydub==0.25.1
+
+# Utilities
+asyncio==3.4.3
+typing-extensions==4.9.0
