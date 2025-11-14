@@ -1,711 +1,335 @@
-import asyncio
-import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import FloodWait, PeerIdInvalid
-from pyrogram.enums import ParseMode
-from pyrogram import raw
-import yt_dlp
-import aiohttp
-import aiofiles
-import os
-from collections import deque
-from typing import Dict, Optional
-import re
-import time
-import json
-import random
 
-# Logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+import os
+import sys
+import logging
+import asyncio
+from typing import Dict, List
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message
+from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant
+
+# This is the bridge library you need.
+from pytgcalls import PyTgCalls, idle
+from pytgcalls.types import AudioLavalink, AudioPiped, GroupCall
+
+# Import the automated Lavalink server manager
+from lavalink_setup import LavalinkManager
+
+# Import the Python client for Lavalink
+import lavalink
+
+# -------------------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------------------
+# Load config from environment variables
+API_ID = os.environ.get("API_ID")
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+SESSION_STRING = os.environ.get("SESSION_STRING") # Userbot session string
+
+# Check if all configs are set
+if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
+    print("Error: API_ID, API_HASH, BOT_TOKEN, and SESSION_STRING env variables must be set.")
+    sys.exit(1)
+
+# Convert API_ID to integer
+try:
+    API_ID = int(API_ID)
+except ValueError:
+    print("Error: API_ID must be an integer.")
+    sys.exit(1)
+
+LAVALINK_HOST = "127.0.0.1"
+LAVALINK_PORT = 2333
+LAVALINK_PASS = "youshallnotpass"
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Configuration
-API_ID = "37862320"
-API_HASH = "cdb4a59a76fae6bd8fa42e77455f8697"
-BOT_TOKEN = "8341511264:AAFjNIOYE5NbABPloFbz-r989l2ySRUs988"
-USER_SESSION = "BQJBu7AAhhG6MmNUFoqJukQOFZDPl5I4QrcapymDjzK5XNYTqaofTEqI5v12xgg0_xkARp-oRG0bXkUhmRB5ziTmjbDSh4I0ty2tGheoT6-mEzOYIsUKMXRuNfAb-Li9eAvlokTfxwCVa9HTBnOD3cPe_plNAUpRuyk5FtUmdeV5Wu_lWcE5cRECGnW0SHO24GiyHoK8jK6BAVL25rVnwLqktC1O2IZn3cam0hCs2ZqSF_B_4Z-8cuREGMaO8IrRnhOl3adW5sUzlOz14FmrHlGeyAL_s8Cb0tgFbST6EAFW25MWVv_0FG_cKbAxWCoR7u9uG4AhX6NrG3g3Z3ZB53N06rEL8AAAAAHQ8OAyAA"
+# -------------------------------------------------------------------------------
+# Bot & Client Initialization
+# -------------------------------------------------------------------------------
 
-# Initialize clients
+# Pyrogram Bot Client (Handles commands)
 bot = Client(
-    "music_bot",
+    "MusicBot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
 )
 
-userbot = Client(
-    "userbot",
+# Pyrogram User Client (Handles audio streaming via PyTgCalls)
+# We use the Session String for this.
+user_app = Client(
+    "MusicUser",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=USER_SESSION
+    session_string=SESSION_STRING,
 )
 
-# Global state management
-class MusicQueue:
-    def __init__(self):
-        self.queues: Dict[int, deque] = {}
-        self.current: Dict[int, dict] = {}
-        self.active_calls: Dict[int, bool] = {}
-        self.call_participants: Dict[int, any] = {}
-    
-    def add(self, chat_id: int, track: dict):
-        if chat_id not in self.queues:
-            self.queues[chat_id] = deque()
-        self.queues[chat_id].append(track)
-    
-    def get_next(self, chat_id: int) -> Optional[dict]:
-        if chat_id in self.queues and self.queues[chat_id]:
-            return self.queues[chat_id].popleft()
-        return None
-    
-    def clear(self, chat_id: int):
-        if chat_id in self.queues:
-            self.queues[chat_id].clear()
-        if chat_id in self.current:
-            del self.current[chat_id]
-    
-    def get_queue(self, chat_id: int) -> list:
-        if chat_id in self.queues:
-            return list(self.queues[chat_id])
-        return []
+# PyTgCalls Client (The bridge)
+pytgcalls = PyTgCalls(user_app)
 
-music_queue = MusicQueue()
+# Lavalink Client (Handles searching and track loading)
+lavalink_client = None
 
-# NUCLEAR OPTION: Most aggressive yt-dlp bypass methods (NO COOKIES)
-def get_ydl_opts_extreme(method=1):
-    """Ultra-aggressive extraction methods that bypass bot detection WITHOUT cookies"""
-    
-    base_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': False,
-        'nocheckcertificate': True,
-        'geo_bypass': True,
-        'age_limit': None,
-        'no_color': True,
-        'socket_timeout': 30,
-        'retries': 10,
-        'fragment_retries': 10,
-        'extractor_retries': 5,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
-    
-    # Rotate user agents to appear more human
-    user_agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    ]
-    
-    if method == 1:
-        # Method 1: Android Music client (BEST for avoiding detection)
-        logger.info("🔧 Using Android Music client bypass")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_music'],
-                    'player_skip': ['webpage', 'configs'],
-                }
-            }
-        })
-    elif method == 2:
-        # Method 2: Android VR client
-        logger.info("🔧 Using Android VR client bypass")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_vr'],
-                    'player_skip': ['webpage'],
-                }
-            }
-        })
-    elif method == 3:
-        # Method 3: iOS Music (very stealthy)
-        logger.info("🔧 Using iOS Music client bypass")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['ios_music'],
-                }
-            }
-        })
-    elif method == 4:
-        # Method 4: MediaConnect (enterprise bypass)
-        logger.info("🔧 Using MediaConnect bypass")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['mediaconnect'],
-                }
-            }
-        })
-    elif method == 5:
-        # Method 5: Multiple clients with po_token skip
-        logger.info("🔧 Using multi-client with po_token skip")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_music', 'android_creator', 'mweb'],
-                    'player_skip': ['webpage', 'configs', 'js'],
-                    'po_token': ['web'],  # Skip po_token requirement
-                }
-            }
-        })
-    elif method == 6:
-        # Method 6: Force IPv4 with random user agent
-        logger.info("🔧 Using IPv4 force with random UA")
-        base_opts.update({
-            'force_ipv4': True,
-            'source_address': '0.0.0.0',
-            'user_agent': random.choice(user_agents),
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_embedded'],
-                    'skip': ['hls', 'dash'],
-                }
-            }
-        })
-    elif method == 7:
-        # Method 7: Web Music with specific headers
-        logger.info("🔧 Using Web Music client")
-        base_opts.update({
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['web_music'],
-                }
-            }
-        })
-    
-    return base_opts
+# In-memory queue
+# { chat_id: [track, track, ...] }
+queue: Dict[int, List[lavalink.Track]] = {}
+current_track: Dict[int, lavalink.Track] = {}
 
-async def download_audio_nuclear(url: str) -> Optional[dict]:
-    """
-    NUCLEAR OPTION: Try every possible method to download WITHOUT cookies
-    This uses the latest yt-dlp bypass techniques
-    """
-    methods = [1, 2, 3, 4, 5, 6, 7]
+# -------------------------------------------------------------------------------
+# Lavalink Event Handlers
+# -------------------------------------------------------------------------------
+
+# This event is triggered when a track starts playing
+@pytgcalls.on_stream_start()
+async def on_stream_start(client: GroupCall, track):
+    chat_id = track.chat_id
+    if chat_id in current_track:
+        song = current_track[chat_id]
+        await bot.send_message(
+            chat_id,
+            f"▶️ **Now Playing:**\n\n[{song.title}]({song.uri})\nby {song.author}"
+        )
+
+# This event is crucial. It's triggered when a track finishes.
+@pytgcalls.on_stream_end()
+async def on_stream_end(client: GroupCall, track):
+    chat_id = track.chat_id
+    current_track.pop(chat_id, None)
     
-    # First, update yt-dlp to latest version
-    logger.info("🔄 Checking yt-dlp version...")
-    
-    for method_num in methods:
+    if chat_id in queue and queue[chat_id]:
+        # Get next song from queue
+        next_song = queue[chat_id].pop(0)
+        current_track[chat_id] = next_song
+        
+        # Play the next song
         try:
-            logger.info(f"🚀 ATTEMPTING METHOD {method_num}/7 for: {url}")
-            ydl_opts = get_ydl_opts_extreme(method_num)
-            
-            # Add random delay to appear more human
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract info
-                info = ydl.extract_info(url, download=True)
-                
-                if not info:
-                    logger.warning(f"❌ Method {method_num}: No info extracted")
-                    continue
-                
-                # Get file path
-                file_path = ydl.prepare_filename(info)
-                base_path = file_path.rsplit('.', 1)[0]
-                mp3_path = base_path + '.mp3'
-                
-                # Wait for file with patience
-                logger.info(f"⏳ Waiting for file: {mp3_path}")
-                max_wait = 45
-                for wait_count in range(max_wait):
-                    if os.path.exists(mp3_path):
-                        break
-                    # Check alternative formats
-                    for ext in ['.m4a', '.webm', '.opus', '.ogg', '.aac']:
-                        alt_path = base_path + ext
-                        if os.path.exists(alt_path):
-                            mp3_path = alt_path
-                            break
-                    if os.path.exists(mp3_path):
-                        break
-                    await asyncio.sleep(1)
-                    
-                    if wait_count % 10 == 0:
-                        logger.info(f"⏳ Still waiting... {wait_count}/{max_wait}s")
-                
-                if not os.path.exists(mp3_path):
-                    logger.warning(f"❌ Method {method_num}: File not created")
-                    continue
-                
-                # SUCCESS!
-                file_size = os.path.getsize(mp3_path) / (1024 * 1024)  # MB
-                logger.info(f"✅✅✅ METHOD {method_num} SUCCESS! File: {file_size:.2f}MB")
-                
-                return {
-                    'title': info.get('title', 'Unknown'),
-                    'duration': info.get('duration', 0),
-                    'file_path': mp3_path,
-                    'url': url,
-                    'thumbnail': info.get('thumbnail', ''),
-                    'uploader': info.get('uploader', 'Unknown')
-                }
-                
-        except yt_dlp.utils.DownloadError as e:
-            error_str = str(e).lower()
-            if 'sign in' in error_str or 'bot' in error_str:
-                logger.error(f"❌ Method {method_num}: Bot detection triggered")
-            else:
-                logger.error(f"❌ Method {method_num}: {str(e)[:100]}")
-            continue
+            await pytgcalls.change_stream(
+                chat_id,
+                AudioLavalink(
+                    next_song.track,
+                    user_id=next_song.requester
+                )
+            )
         except Exception as e:
-            logger.error(f"❌ Method {method_num} unexpected error: {str(e)[:100]}")
-            continue
-    
-    logger.error("💀 ALL 7 METHODS FAILED - YouTube is heavily blocking right now")
-    return None
-
-async def search_youtube_safe(query: str) -> Optional[str]:
-    """Search YouTube with aggressive bypass"""
-    try:
-        search_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'default_search': 'ytsearch1',
-            'extract_flat': True,
-            'geo_bypass': True,
-            'socket_timeout': 15,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_music'],
-                    'player_skip': ['webpage'],
-                }
-            }
-        }
-        
-        with yt_dlp.YoutubeDL(search_opts) as ydl:
-            logger.info(f"🔍 Searching YouTube for: {query}")
-            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-            
-            if info and 'entries' in info and info['entries']:
-                video_id = info['entries'][0].get('id')
-                if video_id:
-                    return f"https://www.youtube.com/watch?v={video_id}"
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        return None
-
-async def safe_send_message(chat_id: int, text: str, reply_to_message_id: int = None) -> Optional[Message]:
-    """Send message without entity errors"""
-    try:
-        clean_text = text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=clean_text,
-            reply_to_message_id=reply_to_message_id,
-            parse_mode=None
-        )
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        try:
-            simple_text = ''.join(c for c in clean_text if c.isprintable() or c in ['\n', '\t'])
-            return await bot.send_message(chat_id=chat_id, text=simple_text)
-        except:
-            return None
-
-async def safe_edit_message(message: Message, text: str) -> bool:
-    """Edit message without entity errors"""
-    try:
-        clean_text = text.replace('**', '').replace('*', '').replace('`', '').replace('_', '')
-        await message.edit_text(clean_text, parse_mode=None)
-        return True
-    except:
-        return False
-
-async def get_chat_peer(chat_id: int):
-    """Resolve chat peer properly"""
-    try:
-        peer = await userbot.resolve_peer(chat_id)
-        return peer
-    except (PeerIdInvalid, KeyError, ValueError):
-        chat = await userbot.get_chat(chat_id)
-        peer = await userbot.resolve_peer(chat_id)
-        return peer
-
-async def join_voice_chat(chat_id: int):
-    """Join voice chat"""
-    try:
-        logger.info(f"Joining voice chat in {chat_id}")
-        peer = await get_chat_peer(chat_id)
-        
-        full_chat = await userbot.invoke(
-            raw.functions.channels.GetFullChannel(channel=peer)
-        )
-        
-        call = full_chat.full_chat.call
-        if not call:
-            logger.error("No active voice chat!")
-            return False
-        
-        result = await userbot.invoke(
-            raw.functions.phone.JoinGroupCall(
-                call=raw.types.InputGroupCall(
-                    id=call.id,
-                    access_hash=call.access_hash
-                ),
-                join_as=peer,
-                params=raw.types.DataJSON(
-                    data=json.dumps({
-                        "ufrag": "test",
-                        "pwd": "test",
-                        "fingerprints": [{
-                            "hash": "sha-256",
-                            "fingerprint": "test",
-                            "setup": "active"
-                        }],
-                        "ssrc": 1
-                    })
-                ),
-                muted=False
-            )
-        )
-        
-        music_queue.active_calls[chat_id] = True
-        music_queue.call_participants[chat_id] = result
-        logger.info(f"✅ Joined voice chat!")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error joining voice chat: {e}")
-        return False
-
-async def leave_voice_chat(chat_id: int):
-    """Leave voice chat"""
-    try:
-        if chat_id not in music_queue.call_participants:
-            return True
-        
-        peer = await get_chat_peer(chat_id)
-        full_chat = await userbot.invoke(
-            raw.functions.channels.GetFullChannel(channel=peer)
-        )
-        
-        call = full_chat.full_chat.call
-        if call:
-            await userbot.invoke(
-                raw.functions.phone.LeaveGroupCall(
-                    call=raw.types.InputGroupCall(
-                        id=call.id,
-                        access_hash=call.access_hash
-                    ),
-                    source=0
-                )
-            )
-        
-        music_queue.active_calls[chat_id] = False
-        if chat_id in music_queue.call_participants:
-            del music_queue.call_participants[chat_id]
-        
-        logger.info(f"✅ Left voice chat")
-        return True
-    except Exception as e:
-        logger.error(f"Error leaving: {e}")
-        return False
-
-async def play_audio(chat_id: int, file_path: str):
-    """Stream audio to voice chat"""
-    try:
-        if not music_queue.active_calls.get(chat_id):
-            success = await join_voice_chat(chat_id)
-            if not success:
-                return False
-        
-        if not os.path.exists(file_path):
-            logger.error(f"File not found: {file_path}")
-            return False
-        
-        logger.info(f"✅ Audio ready: {file_path}")
-        
-        peer = await get_chat_peer(chat_id)
-        full_chat = await userbot.invoke(
-            raw.functions.channels.GetFullChannel(channel=peer)
-        )
-        
-        call = full_chat.full_chat.call
-        if not call:
-            return False
-        
-        await userbot.invoke(
-            raw.functions.phone.EditGroupCallParticipant(
-                call=raw.types.InputGroupCall(
-                    id=call.id,
-                    access_hash=call.access_hash
-                ),
-                participant=peer,
-                muted=False
-            )
-        )
-        
-        logger.info(f"✅ Streaming audio")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error playing: {e}")
-        return False
-
-async def play_next(chat_id: int):
-    """Play next track"""
-    track = music_queue.get_next(chat_id)
-    if not track:
-        await leave_voice_chat(chat_id)
-        return None
-    
-    music_queue.current[chat_id] = track
-    success = await play_audio(chat_id, track['file_path'])
-    
-    if success:
-        return track
+            logger.error(f"Error playing next song in {chat_id}: {e}")
+            await bot.send_message(chat_id, f"Error playing next song: {e}")
     else:
-        return await play_next(chat_id)
+        # Queue is empty, leave the call
+        try:
+            await pytgcalls.leave_group_call(chat_id)
+            await bot.send_message(chat_id, "⏹ Queue finished, leaving voice chat.")
+        except Exception as e:
+            logger.error(f"Error leaving group call in {chat_id}: {e}")
 
-@bot.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    text = (
-        "🎵 Music Bot - NO COOKIES NEEDED!\n\n"
-        "Commands:\n"
-        "/play <song> - Play music\n"
-        "/stop - Stop and clear\n"
-        "/skip - Next song\n"
-        "/queue - Show queue\n\n"
-        "⚠️ IMPORTANT:\n"
-        "1. START voice chat first!\n"
-        "2. Bot must be ADMIN\n"
-        "3. If download fails, try different song\n"
-        "   (YouTube blocks heavily right now)"
+# -------------------------------------------------------------------------------
+# Bot Command Handlers
+# -------------------------------------------------------------------------------
+
+@bot.on_message(filters.command("start") & filters.private)
+async def start_command(_, message: Message):
+    await message.reply(
+        "Hi! I'm a Lavalink music bot.\n"
+        "Add me to a group chat and I'll play music.\n\n"
+        "**Commands:**\n"
+        " - /play [query] - Play a song or add to queue\n"
+        " - /stop - Stop playback and leave\n"
+        " - /skip - Skip to the next song\n"
+        " - /queue - Show the current queue"
     )
-    await safe_send_message(message.chat.id, text, message.id)
 
-@bot.on_message(filters.command("help"))
-async def help_command(client: Client, message: Message):
-    text = (
-        "🎵 Music Bot Help\n\n"
-        "This bot uses 7 different bypass methods\n"
-        "to download from YouTube WITHOUT cookies!\n\n"
-        "Commands:\n"
-        "/play song name - Search and play\n"
-        "/play URL - Direct download\n"
-        "/stop - Stop everything\n"
-        "/skip - Next song\n"
-        "/queue - Show playlist\n\n"
-        "Tips:\n"
-        "- Popular songs work better\n"
-        "- If one song fails, try another\n"
-        "- Bot tries 7 methods automatically\n"
-        "- Each attempt takes 5-10 seconds"
-    )
-    await safe_send_message(message.chat.id, text, message.id)
+@bot.on_message(filters.command("play") & filters.group)
+async def play_command(_, message: Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    query = " ".join(message.command[1:])
 
-@bot.on_message(filters.command("play"))
-async def play_command(client: Client, message: Message):
-    """Play with NUCLEAR bypass methods"""
+    if not query:
+        return await message.reply("Please provide a song name or YouTube URL.")
+        
+    # Search for the track on Lavalink
     try:
-        if len(message.command) < 2:
-            await safe_send_message(
-                message.chat.id,
-                "Usage: /play <song name or URL>",
-                message.id
-            )
-            return
-        
-        query = message.text.split(None, 1)[1]
-        chat_id = message.chat.id
-        
-        status_msg = await safe_send_message(chat_id, "🔍 Searching...", message.id)
-        if not status_msg:
-            return
-        
-        # Check if URL
-        url_pattern = re.compile(r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/')
-        if url_pattern.match(query):
-            url = query
-        else:
-            await safe_edit_message(status_msg, "🔍 Searching YouTube...")
-            url = await search_youtube_safe(query)
-            
-            if not url:
-                await safe_edit_message(status_msg, "❌ No results! Try different search terms.")
-                return
-        
-        # Nuclear download
-        await safe_edit_message(
-            status_msg, 
-            "⬇️ Downloading with bypass methods...\n"
-            "This will try 7 different methods.\n"
-            "Please wait 30-60 seconds..."
-        )
-        
-        track_info = await download_audio_nuclear(url)
-        
-        if not track_info:
-            await safe_edit_message(
-                status_msg,
-                "❌ DOWNLOAD FAILED - All 7 methods blocked!\n\n"
-                "YouTube is heavily restricting downloads right now.\n\n"
-                "What to try:\n"
-                "1. Different song (popular songs work better)\n"
-                "2. Wait 5-10 minutes and retry\n"
-                "3. Try direct YouTube URL instead of search\n"
-                "4. Update yt-dlp: pip install --upgrade yt-dlp\n\n"
-                "If this persists, YouTube may be blocking your IP.\n"
-                "Consider using a VPN or trying later."
-            )
-            return
-        
+        results = await lavalink_client.get_tracks(f"ytsearch:{query}")
+    except Exception as e:
+        logger.error(f"Lavalink search error: {e}")
+        return await message.reply(f"Error searching for track: {e}")
+
+    if not results or not results.tracks:
+        return await message.reply("No tracks found.")
+
+    # Get the first track from the search
+    track = results.tracks[0]
+    track.requester = user_id # Store who requested the song
+
+    # Check if currently playing
+    is_playing = chat_id in current_track
+
+    if is_playing:
         # Add to queue
-        music_queue.add(chat_id, track_info)
-        
-        # Play if nothing playing
-        if chat_id not in music_queue.current or not music_queue.current.get(chat_id):
-            await safe_edit_message(status_msg, "🎵 Starting playback...")
-            track = await play_next(chat_id)
-            
-            if track:
-                duration_str = f"{track['duration'] // 60}:{track['duration'] % 60:02d}"
-                text = (
-                    f"✅ SUCCESS! Now Playing:\n\n"
-                    f"🎵 {track['title']}\n"
-                    f"👤 {track['uploader']}\n"
-                    f"⏱ {duration_str}\n\n"
-                    f"If you don't hear audio:\n"
-                    f"1. Check voice chat is STARTED\n"
-                    f"2. Check bot is ADMIN\n"
-                    f"3. Check your volume"
-                )
-                await safe_edit_message(status_msg, text)
-            else:
-                await safe_edit_message(
-                    status_msg,
-                    "❌ Playback failed!\n\n"
-                    "Checklist:\n"
-                    "- Voice chat STARTED?\n"
-                    "- Bot is ADMIN?\n"
-                    "- Userbot in group?"
-                )
-        else:
-            queue_pos = len(music_queue.get_queue(chat_id))
-            text = (
-                f"✅ Added to queue:\n"
-                f"🎵 {track_info['title']}\n"
-                f"📊 Position: {queue_pos}"
+        if chat_id not in queue:
+            queue[chat_id] = []
+        queue[chat_id].append(track)
+        await message.reply(f"✅ **Added to queue:**\n[{track.title}]({track.uri})")
+    else:
+        # Play immediately
+        current_track[chat_id] = track
+        try:
+            # Join the voice chat
+            await pytgcalls.join_group_call(
+                chat_id,
+                AudioLavalink(
+                    track.track,
+                    user_id=user_id
+                ),
+                stream_type=GroupCall.STREAM_TYPE_MUSIC,
             )
-            await safe_edit_message(status_msg, text)
+            # The 'on_stream_start' event will handle the "Now Playing" message
+        except UserAlreadyParticipant:
+            # Already in the call, just change the stream
+            await pytgcalls.change_stream(
+                chat_id,
+                AudioLavalink(
+                    track.track,
+                    user_id=user_id
+                )
+            )
+        except UserNotParticipant:
+            await message.reply("I can't join. Please check my userbot's permissions.")
+        except Exception as e:
+            logger.error(f"Error joining call in {chat_id}: {e}")
+            await message.reply(f"Error: {e}")
+            current_track.pop(chat_id, None)
+
+@bot.on_message(filters.command("skip") & filters.group)
+async def skip_command(_, message: Message):
+    chat_id = message.chat.id
+
+    if chat_id not in current_track:
+        return await message.reply("Not playing anything.")
+
+    if not queue.get(chat_id):
+        await message.reply("Queue is empty, stopping playback.")
+        await pytgcalls.leave_group_call(chat_id)
+        current_track.pop(chat_id, None)
+        return
+
+    # Get next song
+    next_song = queue[chat_id].pop(0)
+    current_track[chat_id] = next_song
+    
+    try:
+        await pytgcalls.change_stream(
+            chat_id,
+            AudioLavalink(
+                next_song.track,
+                user_id=next_song.requester
+            )
+        )
+        await message.reply("⏭ **Skipped!**")
+        # 'on_stream_start' will announce the new song
+    except Exception as e:
+        logger.error(f"Error skipping in {chat_id}: {e}")
+        await message.reply(f"Error skipping: {e}")
+
+
+@bot.on_message(filters.command("stop") & filters.group)
+async def stop_command(_, message: Message):
+    chat_id = message.chat.id
+    
+    if chat_id not in current_track:
+        return await message.reply("Not playing anything.")
+        
+    try:
+        await pytgcalls.leave_group_call(chat_id)
+        current_track.pop(chat_id, None)
+        queue.pop(chat_id, None)
+        await message.reply("⏹ **Stopped playback** and left voice chat.")
+    except Exception as e:
+        logger.error(f"Error stopping in {chat_id}: {e}")
+        await message.reply(f"Error stopping: {e}")
+
+@bot.on_message(filters.command("queue") & filters.group)
+async def queue_command(_, message: Message):
+    chat_id = message.chat.id
+    
+    if chat_id not in current_track:
+        return await message.reply("Not playing anything.")
+
+    msg = "**Current Queue:**\n\n"
+    
+    # Show current track
+    song = current_track[chat_id]
+    msg += f"**Now Playing:**\n[{song.title}]({song.uri})\n\n"
+
+    # Show upcoming tracks
+    if queue.get(chat_id):
+        msg += "**Up Next:**\n"
+        for i, track in enumerate(queue[chat_id][:10], start=1):
+            msg += f"`{i}.` [{track.title}]({track.uri})\n"
+        
+        if len(queue[chat_id]) > 10:
+            msg += f"\n...and {len(queue[chat_id]) - 10} more."
             
-    except Exception as e:
-        logger.error(f"Play error: {e}")
-        import traceback
-        traceback.print_exc()
-        await safe_send_message(message.chat.id, f"❌ Error: {str(e)[:150]}", message.id)
+    else:
+        msg += "Queue is empty."
 
-@bot.on_message(filters.command("stop"))
-async def stop_command(client: Client, message: Message):
-    try:
-        chat_id = message.chat.id
-        music_queue.clear(chat_id)
-        await leave_voice_chat(chat_id)
-        await safe_send_message(chat_id, "⏹️ Stopped!", message.id)
-        
-        if chat_id in music_queue.current:
-            file_path = music_queue.current[chat_id].get('file_path')
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-    except Exception as e:
-        logger.error(f"Stop error: {e}")
+    await message.reply(msg, disable_web_page_preview=True)
 
-@bot.on_message(filters.command("skip"))
-async def skip_command(client: Client, message: Message):
-    try:
-        chat_id = message.chat.id
-        
-        if chat_id in music_queue.current:
-            file_path = music_queue.current[chat_id].get('file_path')
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-        
-        track = await play_next(chat_id)
-        
-        if track:
-            text = f"⏭️ Skipped!\n🎵 {track['title']}"
-            await safe_send_message(chat_id, text, message.id)
-        else:
-            await safe_send_message(chat_id, "⏹️ Queue empty!", message.id)
-    except Exception as e:
-        logger.error(f"Skip error: {e}")
-
-@bot.on_message(filters.command("queue"))
-async def queue_command(client: Client, message: Message):
-    try:
-        chat_id = message.chat.id
-        current = music_queue.current.get(chat_id)
-        queue = music_queue.get_queue(chat_id)
-        
-        if not current and not queue:
-            await safe_send_message(chat_id, "📭 Queue is empty!", message.id)
-            return
-        
-        response = "📃 Queue:\n\n"
-        if current:
-            response += f"▶️ Now: {current['title']}\n\n"
-        if queue:
-            response += "Next:\n"
-            for i, track in enumerate(queue[:10], 1):
-                response += f"{i}. {track['title']}\n"
-            if len(queue) > 10:
-                response += f"\n...+{len(queue) - 10} more"
-        
-        await safe_send_message(chat_id, response, message.id)
-    except Exception as e:
-        logger.error(f"Queue error: {e}")
+# -------------------------------------------------------------------------------
+# Main Function
+# -------------------------------------------------------------------------------
 
 async def main():
-    os.makedirs("downloads", exist_ok=True)
+    global lavalink_client
     
-    await bot.start()
-    await userbot.start()
-    
-    logger.info("="*60)
-    logger.info("🎵 MUSIC BOT STARTED - NO COOKIES REQUIRED!")
-    logger.info("="*60)
-    logger.info("✅ 7 bypass methods active")
-    logger.info("✅ Android Music, VR, iOS clients ready")
-    logger.info("✅ MediaConnect enterprise bypass enabled")
-    logger.info("="*60)
-    print("\n🚀 Bot ready! Using NUCLEAR bypass methods!")
-    print("⚠️  YouTube blocking is heavy - some songs may fail\n")
-    
-    await asyncio.Event().wait()
+    lavalink_manager = None
+    try:
+        # 1. Start the automated Lavalink server
+        lavalink_manager = LavalinkManager()
+        await lavalink_manager.start()
+        
+        # 2. Start the Pyrogram clients (Bot + User)
+        logger.info("Starting Pyrogram clients...")
+        await bot.start()
+        await user_app.start()
+        
+        # 3. Start PyTgCalls
+        logger.info("Starting PyTgCalls...")
+        await pytgcalls.start()
+
+        # 4. Get the userbot's ID (needed for Lavalink client)
+        userbot_me = await user_app.get_me()
+        
+        # 5. Initialize and connect the Lavalink client
+        logger.info("Initializing Lavalink client...")
+        lavalink_client = lavalink.Client(user_id=userbot_me.id)
+        lavalink_client.add_node(
+            host=LAVALINK_HOST,
+            port=LAVALINK_PORT,
+            password=LAVALINK_PASS,
+            region="us-central" # Region is arbitrary
+        )
+        
+        logger.info("Bot is fully operational!")
+        await idle()
+        
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}", exc_info=True)
+    finally:
+        # 6. Stop everything gracefully
+        logger.info("Stopping clients...")
+        if bot.is_connected:
+            await bot.stop()
+        if user_app.is_connected:
+            await user_app.stop()
+        if lavalink_manager:
+            lavalink_manager.stop()
+        logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
-    try:
-        bot.run(main())
-    except KeyboardInterrupt:
-        logger.info("Stopped")
-    finally:
-        if os.path.exists("downloads"):
-            for file in os.listdir("downloads"):
-                try:
-                    os.remove(os.path.join("downloads", file))
-                except:
-                    pass
+    asyncio.run(main())
