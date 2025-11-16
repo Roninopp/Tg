@@ -99,15 +99,37 @@ def install_package(package_name, pip_name=None):
         pip_name = package_name
     
     print_status(f"Installing {package_name}...", "info")
+    
+    # Try normal install first
     success, stdout, stderr = run_command(f"pip3 install {pip_name}", check=False)
     
     if success:
         print_status(f"✓ {package_name} installed", "success")
         return True
-    else:
-        print_status(f"✗ {package_name} installation failed", "error")
-        print_status(f"Error: {stderr[:200]}", "error")
-        return False
+    
+    # Check if it's externally-managed-environment error
+    if "externally-managed-environment" in stderr.lower():
+        print_status(f"⚠ Detected externally-managed Python", "warning")
+        print_status(f"Trying with --break-system-packages...", "info")
+        
+        # Try with --break-system-packages
+        success, stdout, stderr = run_command(f"pip3 install {pip_name} --break-system-packages", check=False)
+        
+        if success:
+            print_status(f"✓ {package_name} installed", "success")
+            return True
+        
+        # Try with --user flag
+        print_status(f"Trying with --user flag...", "info")
+        success, stdout, stderr = run_command(f"pip3 install --user {pip_name}", check=False)
+        
+        if success:
+            print_status(f"✓ {package_name} installed (user)", "success")
+            return True
+    
+    print_status(f"✗ {package_name} installation failed", "error")
+    print_status(f"Error: {stderr[:200]}", "error")
+    return False
 
 def try_ntgcalls():
     """Try installing NTgCalls (Primary option)"""
