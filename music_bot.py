@@ -210,124 +210,137 @@ async def play_next(chat_id: int):
         await play_next(chat_id)
 
 
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & (filters.private | filters.group))
 async def start_command(client, message: Message):
     """Start command"""
-    await message.reply_text(
-        "🎵 **Welcome to Music Bot!**\n\n"
-        "**Commands:**\n"
-        "/play <song name> - Play a song\n"
-        "/pause - Pause current song\n"
-        "/resume - Resume playback\n"
-        "/skip - Skip current song\n"
-        "/stop - Stop and clear queue\n"
-        "/queue - Show queue\n"
-        "/current - Show current song\n\n"
-        "**Powered by Lavalink**"
-    )
+    try:
+        await message.reply_text(
+            "🎵 **Welcome to Music Bot!**\n\n"
+            "**Commands:**\n"
+            "/play <song name> - Play a song\n"
+            "/pause - Pause current song\n"
+            "/resume - Resume playback\n"
+            "/skip - Skip current song\n"
+            "/stop - Stop and clear queue\n"
+            "/queue - Show queue\n"
+            "/current - Show current song\n\n"
+            "**Powered by Lavalink**"
+        )
+        logger.info(f"Start command from {message.from_user.id}")
+    except Exception as e:
+        logger.error(f"Start command error: {e}")
 
 
-@app.on_message(filters.command("play"))
+@app.on_message(filters.command("play") & (filters.private | filters.group))
 async def play_command(client, message: Message):
     """Play command"""
-    if len(message.command) < 2:
-        await message.reply_text("❌ Usage: /play <song name or URL>")
-        return
-    
-    query = message.text.split(None, 1)[1]
-    chat_id = message.chat.id
-    
-    # Check if user is in voice chat
     try:
-        chat = await client.get_chat(chat_id)
-        if not chat.type in ["group", "supergroup"]:
-            await message.reply_text("❌ This command only works in groups!")
-            return
-    except:
-        pass
-    
-    status_msg = await message.reply_text("🔍 Searching...")
-    
-    try:
-        # Search using Lavalink
-        result = await lavalink.search(query)
-        
-        if not result or result.get("loadType") == "error":
-            await status_msg.edit_text("❌ No results found!")
+        if len(message.command) < 2:
+            await message.reply_text("❌ Usage: /play <song name or URL>")
             return
         
-        # Get track info
-        load_type = result.get("loadType")
+        query = message.text.split(None, 1)[1]
+        chat_id = message.chat.id
         
-        if load_type == "track":
-            track = result["data"]
-            tracks = [track]
-        elif load_type == "search":
-            tracks = result["data"][:1]  # Take first result
-        elif load_type == "playlist":
-            tracks = result["data"]["tracks"][:10]  # Limit to 10
-        else:
-            await status_msg.edit_text("❌ Could not load track!")
-            return
+        logger.info(f"Play command: {query} from chat {chat_id}")
         
-        if not tracks:
-            await status_msg.edit_text("❌ No tracks found!")
-            return
+        # Check if user is in voice chat
+        try:
+            chat = await client.get_chat(chat_id)
+            if not chat.type in ["group", "supergroup"]:
+                await message.reply_text("❌ This command only works in groups!")
+                return
+        except:
+            pass
         
-        # Add to queue
-        if chat_id not in queues:
-            queues[chat_id] = []
+        status_msg = await message.reply_text("🔍 Searching...")
         
-        added_count = 0
-        for track in tracks:
-            info = track.get("info", {})
-            song_info = {
-                "title": info.get("title", "Unknown"),
-                "author": info.get("author", "Unknown"),
-                "duration": info.get("length", 0),
-                "track": track.get("encoded"),
-                "requester": message.from_user.mention
-            }
-            queues[chat_id].append(song_info)
-            added_count += 1
-        
-        # Start playing if nothing is playing
-        if chat_id not in current_playing:
-            await status_msg.edit_text(f"▶️ Playing: **{tracks[0]['info']['title']}**")
-            await play_next(chat_id)
-        else:
-            if added_count == 1:
-                await status_msg.edit_text(
-                    f"✅ Added to queue:\n**{tracks[0]['info']['title']}**\n"
-                    f"Position: {len(queues[chat_id])}"
-                )
+        try:
+            # Search using Lavalink
+            result = await lavalink.search(query)
+            
+            if not result or result.get("loadType") == "error":
+                await status_msg.edit_text("❌ No results found!")
+                return
+            
+            # Get track info
+            load_type = result.get("loadType")
+            
+            if load_type == "track":
+                track = result["data"]
+                tracks = [track]
+            elif load_type == "search":
+                tracks = result["data"][:1]  # Take first result
+            elif load_type == "playlist":
+                tracks = result["data"]["tracks"][:10]  # Limit to 10
             else:
-                await status_msg.edit_text(
-                    f"✅ Added {added_count} songs to queue"
-                )
-    
+                await status_msg.edit_text("❌ Could not load track!")
+                return
+            
+            if not tracks:
+                await status_msg.edit_text("❌ No tracks found!")
+                return
+            
+            # Add to queue
+            if chat_id not in queues:
+                queues[chat_id] = []
+            
+            added_count = 0
+            for track in tracks:
+                info = track.get("info", {})
+                song_info = {
+                    "title": info.get("title", "Unknown"),
+                    "author": info.get("author", "Unknown"),
+                    "duration": info.get("length", 0),
+                    "track": track.get("encoded"),
+                    "requester": message.from_user.mention
+                }
+                queues[chat_id].append(song_info)
+                added_count += 1
+            
+            # Start playing if nothing is playing
+            if chat_id not in current_playing:
+                await status_msg.edit_text(f"▶️ Playing: **{tracks[0]['info']['title']}**")
+                await play_next(chat_id)
+            else:
+                if added_count == 1:
+                    await status_msg.edit_text(
+                        f"✅ Added to queue:\n**{tracks[0]['info']['title']}**\n"
+                        f"Position: {len(queues[chat_id])}"
+                    )
+                else:
+                    await status_msg.edit_text(
+                        f"✅ Added {added_count} songs to queue"
+                    )
+        
+        except Exception as e:
+            logger.error(f"Play error: {e}")
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
     except Exception as e:
-        logger.error(f"Play error: {e}")
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        logger.error(f"Play command error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
 
-@app.on_message(filters.command("pause"))
+@app.on_message(filters.command("pause") & filters.group)
 async def pause_command(client, message: Message):
     """Pause command"""
-    chat_id = message.chat.id
-    
-    if chat_id not in current_playing:
-        await message.reply_text("❌ Nothing is playing!")
-        return
-    
     try:
-        if TGCALLS_LIB == "ntgcalls":
-            await tgcalls.pause(chat_id)
-        else:
-            await tgcalls.pause_stream(chat_id)
-        await message.reply_text("⏸ Paused")
+        chat_id = message.chat.id
+        
+        if chat_id not in current_playing:
+            await message.reply_text("❌ Nothing is playing!")
+            return
+        
+        try:
+            if TGCALLS_LIB == "ntgcalls":
+                await tgcalls.pause(chat_id)
+            else:
+                await tgcalls.pause_stream(chat_id)
+            await message.reply_text("⏸ Paused")
+        except Exception as e:
+            await message.reply_text(f"❌ Error: {str(e)}")
     except Exception as e:
-        await message.reply_text(f"❌ Error: {str(e)}")
+        logger.error(f"Pause command error: {e}")
 
 
 @app.on_message(filters.command("resume"))
@@ -461,6 +474,11 @@ async def main():
     
     logger.info("✓ Bot started successfully!")
     logger.info("Press Ctrl+C to stop")
+    
+    # Add message handler for debugging
+    @app.on_message(filters.text)
+    async def message_handler(client, message):
+        logger.info(f"Received message from {message.from_user.id}: {message.text[:50]}")
     
     # Start app
     await app.start()
