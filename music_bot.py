@@ -15,7 +15,14 @@ from pyrogram.errors import ChatAdminRequired, UserNotParticipant
 
 # Import config
 try:
-    from config import API_ID, API_HASH, BOT_TOKEN, LAVALINK_HOST, LAVALINK_PORT, LAVALINK_PASSWORD
+    from config import API_ID, API_HASH, LAVALINK_HOST, LAVALINK_PORT, LAVALINK_PASSWORD
+    # Check if using bot or userbot mode
+    try:
+        from config import BOT_TOKEN
+        USE_USERBOT = False
+    except ImportError:
+        BOT_TOKEN = None
+        USE_USERBOT = True
 except ImportError:
     print("❌ Error: config.py not found!")
     print("Please create config.py with your credentials")
@@ -63,12 +70,23 @@ except ImportError:
     sys.exit(1)
 
 # Initialize Pyrogram client
-app = Client(
-    "music_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+if USE_USERBOT:
+    # Userbot mode - will ask for phone number or use session
+    app = Client(
+        "music_userbot",
+        api_id=API_ID,
+        api_hash=API_HASH
+    )
+    logger.info("Using USERBOT mode")
+else:
+    # Bot mode
+    app = Client(
+        "music_bot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
+    logger.info("Using BOT mode")
 
 # Initialize voice calls client
 if TGCALLS_LIB == "ntgcalls":
@@ -429,10 +447,12 @@ async def main():
             else:
                 logger.error("❌ Cannot connect to Lavalink!")
                 logger.error("Make sure Lavalink is running on localhost:2333")
+                await lavalink.close()
                 return
     except Exception as e:
         logger.error(f"❌ Lavalink connection failed: {e}")
         logger.error("Run lavalink_setup.py first and start Lavalink!")
+        await lavalink.close()
         return
     
     # Start TgCalls
@@ -442,15 +462,20 @@ async def main():
     logger.info("✓ Bot started successfully!")
     logger.info("Press Ctrl+C to stop")
     
-    # Keep running
-    await app.run()
+    # Start app
+    await app.start()
+    
+    # Keep alive
+    from pyrogram import idle
+    await idle()
+    
+    # Cleanup
+    await app.stop()
+    await lavalink.close()
 
 
 if __name__ == "__main__":
     try:
-        app.run(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("\n✓ Bot stopped")
-    finally:
-        if lavalink.session:
-            asyncio.run(lavalink.close())
